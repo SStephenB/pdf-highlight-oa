@@ -2,13 +2,10 @@
 import { IHighlight } from "react-pdf-highlighter";
 import * as pdfjs from "pdfjs-dist";
 
-// TODO: Consider using a library like 'google-ocr' for more accurate text recognition
-// and cases where text is not embedded in the pdf itself (e.g. scanned document)
-
-// Constants for fixed dimensions
-// FIXME: These values might not be appropriate for all PDFs
-const FIXED_WIDTH = 800;
-const FIXED_HEIGHT = 1200;
+//Import Tesseract for OCR.
+import Tesseract from 'tesseract.js';
+//Import pdf-img-convert to allow input of pdfs (to be converted to images) for OCR in Tesseract.
+import pdf2img from 'pdf-img-convert';
 
 /**
  * Searches a PDF for given keywords and returns highlights
@@ -28,34 +25,54 @@ export const searchPdf = async (
     // Load the PDF document
     const pdf = await pdfjs.getDocument(pdfUrl).promise;
     const numPages = pdf.numPages;
+    const firstPage = await pdf.getPage(1);
 
-    // Iterate through each page of the PDF
-    for (let pageNum = 1; pageNum <= numPages; pageNum++) {
-      const page = await pdf.getPage(pageNum);
-      const viewport = page.getViewport({ scale: viewportZoom });
+    if ((await firstPage.getTextContent()).items.length > 0) {
+      // Iterate through each page of the PDF
+      for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+        const page = await pdf.getPage(pageNum);
+        const viewport = page.getViewport({ scale: viewportZoom });
 
-      // Create an adjusted viewport to flip the y-coordinate
-      // FIXME: This might not be necessary or correct for all PDFs
-      const adjustedViewport = {
-        ...viewport,
-        convertToViewportPoint: (x: number, y: number) => {
-          const [vx, vy] = viewport.convertToViewportPoint(x, y);
-          return [vx, viewport.height - vy];
-        },
-      };
+        // Create an adjusted viewport to flip the y-coordinate
+        // FIXME: This might not be necessary or correct for all PDFs
+        const adjustedViewport = {
+          ...viewport,
+          convertToViewportPoint: (x: number, y: number) => {
+            const [vx, vy] = viewport.convertToViewportPoint(x, y);
+            return [vx, viewport.height - vy];
+          },
+        };
 
-      // Extract text content from the page
-      const textContent = await page.getTextContent();
-      const textItems = textContent.items as any[];
+        // Extract text content from the page
+        const textContent = await page.getTextContent();
+        const textItems = textContent.items as any[];
 
-      let lastY: number | null = null;
-      let textLine = "";
-      let lineItems: any[] = [];
+        let lastY: number | null = null;
+        let textLine = "";
+        let lineItems: any[] = [];
 
-      // Group text items into lines
-      for (const item of textItems) {
-        if (lastY !== item.transform[5] && lineItems.length > 0) {
-          // Process the completed line
+        // Group text items into lines
+        for (const item of textItems) {
+          if (lastY !== item.transform[5] && lineItems.length > 0) {
+            // Process the completed line
+            processLine(
+              lineItems,
+              textLine,
+              keywords,
+              pageNum,
+              highlights,
+              adjustedViewport
+            );
+            textLine = "";
+            lineItems = [];
+          }
+          textLine += item.str;
+          lineItems.push(item);
+          lastY = item.transform[5];
+        }
+
+        // Process the last line if it exists
+        if (lineItems.length > 0) {
           processLine(
             lineItems,
             textLine,
@@ -64,23 +81,39 @@ export const searchPdf = async (
             highlights,
             adjustedViewport
           );
-          textLine = "";
-          lineItems = [];
         }
-        textLine += item.str;
-        lineItems.push(item);
-        lastY = item.transform[5];
+      }
+    }
+    // No text found in PDF. Convert to image, then OCR.
+    else {
+      // Calls on Image Conversion API to convert the PDF to an image.
+      const response = await fetch("api/convertToImage", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({ pdfUrl }),
+      });
+
+      //Uses Tesseract to read the text in the image.
+      const images = await response.json();
+      const allOcr: string[] = []
+      for (const img of images) {
+        const ocr = await Tesseract.recognize(img, "eng");
+        allOcr.push(ocr.data.text);
       }
 
-      // Process the last line if it exists
-      if (lineItems.length > 0) {
-        processLine(
-          lineItems,
-          textLine,
+      for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+        const page = await pdf.getPage(pageNum);
+        const viewport = page.getViewport({ scale: viewportZoom });
+        const ocrText = allOcr[pageNum - 1];
+
+        processOcrTextForKeywords(
+          ocrText,
           keywords,
           pageNum,
           highlights,
-          adjustedViewport
+          viewport,
         );
       }
     }
@@ -140,9 +173,9 @@ const processLine = (
       const x1 = startItem.transform[4];
       const y1 = startItem.transform[5];
       const x2 = endItem.transform[4] + endItem.width;
+      const lineHeight = Math.max(...lineItems.map((item) => item.height))
       const y2 =
-        startItem.transform[5] +
-        Math.max(...lineItems.map((item) => item.height));
+        startItem.transform[5] + lineHeight;
 
       // Convert coordinates to viewport points
       const [tx1, ty1] = viewport.convertToViewportPoint(x1, y1);
@@ -162,8 +195,8 @@ const processLine = (
             y1: Math.min(flippedY1, flippedY2),
             x2: tx2,
             y2: Math.max(flippedY1, flippedY2),
-            width: FIXED_WIDTH,
-            height: FIXED_HEIGHT,
+            width: viewport.width,
+            height: viewport.height,
             pageNumber,
           },
           rects: [
@@ -172,8 +205,9 @@ const processLine = (
               y1: Math.min(flippedY1, flippedY2),
               x2: tx2,
               y2: Math.max(flippedY1, flippedY2),
-              width: FIXED_WIDTH,
-              height: FIXED_HEIGHT,
+              // Changed use of fixed width and fixed height to the width and height of the viewport.
+              width: viewport.width,
+              height: viewport.height,
               pageNumber,
             },
           ],
@@ -185,6 +219,73 @@ const processLine = (
     }
   });
 };
+
+const processOcrTextForKeywords = (
+  ocrText: string,
+  keywords: string[],
+  pageNumber: number,
+  highlights: IHighlight[],
+  viewport: any
+) => {
+  // Split OCR text into lines
+  const lines = ocrText.split("\n");
+  const totalLines = lines.length;
+
+  // Iterate over each keyword
+  keywords.forEach((keyword) => {
+    lines.forEach((line, lineIndex) => {
+      const regex = new RegExp(keyword, "gi");
+      let match;
+
+      // Search for keyword matches in each line
+      while ((match = regex.exec(line)) !== null) {
+        const startIndex = match.index;
+        const endIndex = startIndex + match[0].length;
+
+        // Approximate y position based on the line number
+        const linePosition = lineIndex / totalLines;
+        const y1 = viewport.height * linePosition; // Top of the line
+        const y2 = y1 + 12; // Approximate height for the line (Can be adjusted)
+
+        // Calculate approximate x positions for the highlight
+        const textLength = line.length;
+        const x1 = viewport.width * (startIndex / textLength); // Start position based on keyword index
+        const x2 = viewport.width * (endIndex / textLength); // End position based on keyword length
+
+        // Create the highlight
+        highlights.push({
+          content: { text: match[0] },
+          position: {
+            boundingRect: {
+              x1,
+              y1,
+              x2,
+              y2,
+              width: viewport.width,
+              height: viewport.height,
+              pageNumber,
+            },
+            rects: [
+              {
+                x1,
+                y1,
+                x2,
+                y2,
+                width: viewport.width,
+                height: viewport.height,
+                pageNumber,
+              },
+            ],
+            pageNumber,
+          },
+          comment: { text: `Found "${match[0]}"`, emoji: "🔍" },
+          id: getNextId(),
+        });
+      }
+    });
+  });
+};
+
 
 /**
  * Generates a unique ID for highlights
